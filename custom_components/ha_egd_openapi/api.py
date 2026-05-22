@@ -19,6 +19,22 @@ AUTHORIZATION_ERROR_FRAGMENT = "nemáte oprávnění na data odběrného místa"
 VALIDATION_ERROR_FRAGMENT = "validation_error"
 DEFAULT_PAGE_SIZE = 3000
 MAX_PROFILE_CHUNK = timedelta(days=30, hours=23, minutes=45)
+INTERVAL_LENGTH = timedelta(minutes=15)
+
+
+def _format_egd_timestamp(value: datetime) -> str:
+    """Format a timestamp for EG.D query parameters."""
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _format_egd_profile_to(value: datetime) -> str:
+    """Format EG.D profile upper bound.
+
+    The API treats the `to` parameter as an exclusive interval boundary. Add
+    one quarter-hour so callers can keep using `to_dt` as the last requested
+    measurement timestamp.
+    """
+    return _format_egd_timestamp(value + INTERVAL_LENGTH)
 
 
 def _safe_three_year_cap(reference: datetime | None = None) -> datetime:
@@ -190,8 +206,8 @@ class EgdApiClient:
         params = {
             "ean": ean,
             "profile": profile,
-            "from": from_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "to": to_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "from": _format_egd_timestamp(from_dt),
+            "to": _format_egd_profile_to(to_dt),
             "pageStart": str(page_start),
             "pageSize": str(page_size),
         }
