@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -18,6 +19,7 @@ from custom_components.ha_egd_openapi.const import (
     DIAGNOSTICS_EVENTS_KEY,
     MAX_DIAGNOSTIC_EVENTS,
 )
+from custom_components.ha_egd_openapi import coordinator as coordinator_module
 from custom_components.ha_egd_openapi.coordinator import EgdDataUpdateCoordinator
 
 
@@ -126,6 +128,28 @@ def test_waiting_for_latest_data_detects_missing_latest_day() -> None:
     )
 
 
+def test_latest_available_timestamp_avoids_today_validation_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Newest sync window should not require an EG.D `to` value at today's midnight."""
+    coordinator = _build_coordinator()
+    prague = ZoneInfo("Europe/Prague")
+    monkeypatch.setattr(
+        coordinator_module.dt_util,
+        "now",
+        lambda: datetime(2026, 5, 23, 8, 33, tzinfo=prague),
+    )
+
+    assert coordinator._get_latest_available_utc() == datetime(  # noqa: SLF001
+        2026,
+        5,
+        22,
+        21,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+
 def test_store_error_state_updates_diagnostic_persisted_values() -> None:
     """A failed refresh should leave a clear diagnostic footprint in persisted state."""
     coordinator = _build_coordinator()
@@ -152,6 +176,36 @@ def test_did_timestamp_advance_only_when_value_moves_forward() -> None:
     assert not EgdDataUpdateCoordinator._did_timestamp_advance(  # noqa: SLF001
         current=None,
         previous=previous,
+    )
+
+
+def test_successful_sync_timestamp_does_not_advance_while_waiting() -> None:
+    """Revalidation writes must not make a waiting refresh look successful."""
+    previous = datetime(2026, 5, 20, 21, 45, tzinfo=timezone.utc)
+
+    assert not EgdDataUpdateCoordinator._should_advance_successful_sync(  # noqa: SLF001
+        sync_status="waiting_for_data",
+        import_stats_written=True,
+        export_stats_written=True,
+        import_last_valid_ts=previous,
+        export_last_valid_ts=previous,
+        previous_import_ts=previous,
+        previous_export_ts=previous,
+    )
+
+
+def test_successful_sync_timestamp_advances_when_refresh_is_complete() -> None:
+    """Completed refreshes with written statistics should update last success."""
+    previous = datetime(2026, 5, 20, 21, 45, tzinfo=timezone.utc)
+
+    assert EgdDataUpdateCoordinator._should_advance_successful_sync(  # noqa: SLF001
+        sync_status="ok",
+        import_stats_written=True,
+        export_stats_written=False,
+        import_last_valid_ts=previous,
+        export_last_valid_ts=previous,
+        previous_import_ts=previous,
+        previous_export_ts=previous,
     )
 
 

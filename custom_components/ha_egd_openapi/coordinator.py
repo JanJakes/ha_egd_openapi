@@ -386,20 +386,17 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             )
             else "ok"
         )
-        # last_api_sync_utc means the latest successful sync that delivered
-        # fresher usable data, even if EG.D still does not provide the whole
-        # newest expected day and the state remains waiting_for_data.
-        should_advance_successful_sync = (
-            bool(import_stats)
-            or bool(export_stats)
-            or self._did_timestamp_advance(
-                current=import_meta["last_valid_ts"],
-                previous=self._parse_dt(self._persisted.get(ATTR_LAST_VALID_IMPORT_TS)),
-            )
-            or self._did_timestamp_advance(
-                current=export_meta["last_valid_ts"],
-                previous=self._parse_dt(self._persisted.get(ATTR_LAST_VALID_EXPORT_TS)),
-            )
+        # last_api_sync_utc tracks completed syncs only. Revalidation may write
+        # older corrected rows while the newest expected day is still missing;
+        # that must not make the "last successful sync" sensor look fresh.
+        should_advance_successful_sync = self._should_advance_successful_sync(
+            sync_status=sync_status,
+            import_stats_written=bool(import_stats),
+            export_stats_written=bool(export_stats),
+            import_last_valid_ts=import_meta["last_valid_ts"],
+            export_last_valid_ts=export_meta["last_valid_ts"],
+            previous_import_ts=self._parse_dt(self._persisted.get(ATTR_LAST_VALID_IMPORT_TS)),
+            previous_export_ts=self._parse_dt(self._persisted.get(ATTR_LAST_VALID_EXPORT_TS)),
         )
         last_successful_sync_utc = (
             self._iso(now_utc)
@@ -989,6 +986,34 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             return True
         return current > previous
 
+    @classmethod
+    def _should_advance_successful_sync(
+        cls,
+        *,
+        sync_status: str,
+        import_stats_written: bool,
+        export_stats_written: bool,
+        import_last_valid_ts: datetime | None,
+        export_last_valid_ts: datetime | None,
+        previous_import_ts: datetime | None,
+        previous_export_ts: datetime | None,
+    ) -> bool:
+        """Return whether the successful-sync timestamp should move forward."""
+        if sync_status != "ok":
+            return False
+        return (
+            import_stats_written
+            or export_stats_written
+            or cls._did_timestamp_advance(
+                current=import_last_valid_ts,
+                previous=previous_import_ts,
+            )
+            or cls._did_timestamp_advance(
+                current=export_last_valid_ts,
+                previous=previous_export_ts,
+            )
+        )
+
     def _get_revalidation_start(self, latest_available_utc: datetime) -> datetime:
         """Return start of rolling revalidation window in UTC."""
         revalidate_days = max(
@@ -1069,12 +1094,14 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
     def _get_latest_available_utc(self) -> datetime:
         """Return latest allowed EG.D quarter-hour timestamp.
 
-        EG.D allows querying only up to yesterday and the last slot is 23:45.
+        EG.D allows querying only up to yesterday. Its `to` parameter behaves
+        like an exclusive boundary, so the newest safe local slot is 23:30; the
+        final 23:45 slot is repaired by the next day's revalidation.
         """
         now_local = dt_util.now()
         latest_local = datetime.combine(
             now_local.date() - timedelta(days=1),
-            time(23, 45),
+            time(23, 30),
             tzinfo=now_local.tzinfo,
         )
         return latest_local.astimezone(timezone.utc)
