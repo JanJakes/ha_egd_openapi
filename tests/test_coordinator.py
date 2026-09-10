@@ -9,9 +9,10 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
-from custom_components.ha_egd_openapi.api import IntervalRecord
 from types import SimpleNamespace
 
+from custom_components.ha_egd_openapi import coordinator as coordinator_module
+from custom_components.ha_egd_openapi.api import IntervalRecord
 from custom_components.ha_egd_openapi.const import (
     ATTR_LAST_ERROR,
     ATTR_SYNC_STATUS,
@@ -19,7 +20,6 @@ from custom_components.ha_egd_openapi.const import (
     DIAGNOSTICS_EVENTS_KEY,
     MAX_DIAGNOSTIC_EVENTS,
 )
-from custom_components.ha_egd_openapi import coordinator as coordinator_module
 from custom_components.ha_egd_openapi.coordinator import EgdDataUpdateCoordinator
 
 
@@ -150,15 +150,22 @@ def test_latest_available_timestamp_avoids_today_validation_boundary(
     )
 
 
-def test_store_error_state_updates_diagnostic_persisted_values() -> None:
+@pytest.mark.parametrize("last_success", [None, "2026-04-09T18:00:00Z"])
+def test_store_error_state_updates_diagnostic_persisted_values(
+    last_success: str | None,
+) -> None:
     """A failed refresh should leave a clear diagnostic footprint in persisted state."""
     coordinator = _build_coordinator()
+
+    if last_success is not None:
+        coordinator._persisted["last_api_sync_utc"] = last_success
 
     coordinator._store_error_state("Boom")  # noqa: SLF001
 
     assert coordinator._persisted[ATTR_SYNC_STATUS] == "error"  # noqa: SLF001
     assert coordinator._persisted[ATTR_LAST_ERROR] == "Boom"  # noqa: SLF001
-    assert coordinator._persisted["last_api_sync_utc"].endswith("Z")  # noqa: SLF001
+    assert coordinator._persisted.get("last_api_sync_utc") == last_success
+    assert coordinator._persisted["last_check_finished_utc"].endswith("Z")
 
 
 def test_did_timestamp_advance_only_when_value_moves_forward() -> None:
