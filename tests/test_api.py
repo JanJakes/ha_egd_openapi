@@ -72,7 +72,7 @@ async def test_profile_data_fetch_splits_initial_history_into_page_sized_chunks(
     from_dt = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     to_dt = datetime(2026, 4, 15, 23, 45, tzinfo=timezone.utc)
     client = _RecordingClient()
-    monkeypatch.setattr(api, "_safe_three_year_cap", lambda: from_dt - timedelta(days=1))
+    monkeypatch.setattr(api, "get_history_start", lambda: from_dt - timedelta(days=1))
 
     await client.async_get_profile_data(
         ean="859182400000000000",
@@ -263,7 +263,7 @@ async def test_history_and_revalidation_preserve_every_interval(
     days = 62
     start = datetime(2025, 9, 1, tzinfo=timezone.utc)
     end = start + timedelta(days=days, minutes=-15)
-    monkeypatch.setattr(api, "_safe_three_year_cap", lambda: start)
+    monkeypatch.setattr(api, "get_history_start", lambda: start)
 
     async def respond(**kwargs):
         chunk_from, chunk_to = kwargs["from_dt"], kwargs["to_dt"]

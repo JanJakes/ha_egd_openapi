@@ -38,20 +38,19 @@ def _format_egd_profile_to(value: datetime) -> str:
     return _format_egd_timestamp(value + INTERVAL_LENGTH)
 
 
-def _safe_three_year_cap(reference: datetime | None = None) -> datetime:
-    """Return a conservative lower bound accepted by EG.D.
-
-    EG.D enforces a rolling 3-year limit, but the exact comparison appears to
-    happen on the server side against its current date/time. We therefore keep
-    a one-day safety margin to avoid boundary failures around timezone / leap
-    year differences.
-    """
+def get_history_start(reference: datetime | None = None) -> datetime:
+    """Return the first UTC quarter-hour inside the three-year safety margin."""
     ref = (reference or datetime.now(timezone.utc)).astimezone(timezone.utc)
     try:
         capped = ref.replace(year=ref.year - 3)
     except ValueError:
         capped = ref.replace(month=2, day=28, year=ref.year - 3)
-    return capped + timedelta(days=1)
+    # Keep a full day inside the server's rolling retention boundary.
+    cutoff = capped + timedelta(days=1)
+    interval_start = cutoff.replace(
+        minute=cutoff.minute // 15 * 15, second=0, microsecond=0
+    )
+    return interval_start + INTERVAL_LENGTH if interval_start < cutoff else interval_start
 
 
 class EgdApiError(Exception):
@@ -289,6 +288,13 @@ class EgdApiClient:
         Uses a very small request to determine whether the server accepts the
         requested time window.
         """
+        if from_dt.tzinfo is None or to_dt.tzinfo is None:
+            raise ValueError("from_dt and to_dt must be timezone-aware")
+        from_dt = max(from_dt.astimezone(timezone.utc), get_history_start())
+        to_dt = to_dt.astimezone(timezone.utc)
+        if from_dt > to_dt:
+            return False
+
         try:
             await self._async_get_profile_data_chunk(
                 ean=ean,
@@ -348,7 +354,7 @@ class EgdApiClient:
         """
         if from_dt.tzinfo is None or to_dt.tzinfo is None:
             raise ValueError("from_dt and to_dt must be timezone-aware")
-        effective_from = max(from_dt.astimezone(timezone.utc), _safe_three_year_cap())
+        effective_from = max(from_dt.astimezone(timezone.utc), get_history_start())
         effective_to = to_dt.astimezone(timezone.utc)
         if effective_from > effective_to:
             _LOGGER.debug(
