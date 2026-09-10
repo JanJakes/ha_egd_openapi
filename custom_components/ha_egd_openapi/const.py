@@ -26,7 +26,14 @@ DEFAULT_ENABLE_DIAGNOSTICS = False
 
 OAUTH_URL = "https://idm.distribuce24.cz/oauth/token"
 DATA_URL = "https://data.distribuce24.cz/rest/spotreby"
-STATUS_VALID = "IU012"
+PROFILE_UNITS = {
+    "ICQ2": "kWh",
+    "ICC1": "kW",
+    "ISQ2": "kWh",
+    "ISC1": "kW",
+    "DCQC": "kWh",
+    "DSQC": "kWh",
+}
 
 STORE_VERSION = 1
 STORE_KEY = f"{DOMAIN}_store"

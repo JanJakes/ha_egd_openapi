@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import logging
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
 from aiohttp import ClientError
 
-from .const import DATA_URL, OAUTH_URL
+from .const import DATA_URL, OAUTH_URL, PROFILE_UNITS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ class IntervalRecord:
     """One interval record from EG.D."""
 
     timestamp: datetime
-    value: float
+    value: float | None
     status: str
 
 
@@ -295,6 +296,7 @@ class EgdApiClient:
                 from_dt=from_dt,
                 to_dt=to_dt,
                 page_size=1,
+                first_page_only=True,
             )
         except EgdValidationError as err:
             if err.is_authorization_window_error:
@@ -411,6 +413,7 @@ class EgdApiClient:
         from_dt: datetime,
         to_dt: datetime,
         page_size: int = DEFAULT_PAGE_SIZE,
+        first_page_only: bool = False,
     ) -> list[IntervalRecord]:
         """Fetch one API chunk including paging."""
         # In practice EG.D pagination behaves as 1-based even though the PDF
@@ -418,6 +421,8 @@ class EgdApiClient:
         # without an explicit API error.
         page_start = 1
         records: list[IntervalRecord] = []
+        seen_timestamps: set[datetime] = set()
+        total: int | None = None
 
         while True:
             status, data = await self._async_request_profile_data(
@@ -440,9 +445,11 @@ class EgdApiClient:
             elif isinstance(data, list):
                 payloads = data
             else:
-                payloads = []
+                raise EgdApiError("Unexpected profile response format")
 
             if not payloads:
+                if total is not None and len(records) < total:
+                    raise EgdApiError("Incomplete profile response: missing page")
                 self._log_diagnostic(
                     "debug",
                     "profile_chunk_empty",
@@ -454,21 +461,47 @@ class EgdApiClient:
                 )
                 return records
 
+            if len(payloads) != 1 or not isinstance(payloads[0], dict):
+                raise EgdApiError("Unexpected profile response format")
             payload = payloads[0]
-            batch = payload.get("data", [])
-            total = int(payload.get("total", len(batch)))
+            if payload.get("profile", profile) != profile:
+                raise EgdApiError("Unexpected profile in response")
+            units = payload.get("units")
+            if units is not None and str(units).casefold() != PROFILE_UNITS[profile].casefold():
+                raise EgdApiError(f"Unexpected units for {profile}: {units}")
+            batch = payload.get("data")
+            if not isinstance(batch, list):
+                raise EgdApiError("Profile response does not contain a data list")
+            if "total" in payload:
+                try:
+                    page_total = int(payload["total"])
+                except (TypeError, ValueError) as err:
+                    raise EgdApiError("Invalid profile response total") from err
+                if page_total < 0 or (total is not None and page_total != total):
+                    raise EgdApiError("Profile response total changed during pagination")
+                total = page_total
+            if not batch and total is not None and len(records) < total:
+                raise EgdApiError("Incomplete profile response: empty page before total")
 
             for item in batch:
                 ts = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+                if ts in seen_timestamps:
+                    raise EgdApiError("Duplicate interval in profile response")
+                seen_timestamps.add(ts)
+                value = item.get("value")
                 records.append(
                     IntervalRecord(
                         timestamp=ts,
-                        value=float(item.get("value", 0.0)),
+                        value=float(value) if value is not None else None,
                         status=str(item.get("status", "")),
                     )
                 )
 
-            if len(batch) < page_size or len(records) >= total:
+            if total is not None and len(records) > total:
+                raise EgdApiError("Profile response exceeds reported total")
+            if first_page_only or (total is not None and len(records) == total):
+                break
+            if total is None and len(batch) < page_size:
                 break
             page_start += len(batch)
 

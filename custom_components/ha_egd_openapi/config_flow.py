@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
 from homeassistant.helpers import aiohttp_client, selector
@@ -13,9 +12,9 @@ from homeassistant.helpers import aiohttp_client, selector
 from .api import EgdApiClient, EgdApiError, EgdAuthError
 from .const import (
     CONF_CLIENT_ID,
-    CONF_ENABLE_DIAGNOSTICS,
     CONF_CLIENT_SECRET,
     CONF_EAN,
+    CONF_ENABLE_DIAGNOSTICS,
     CONF_EXPORT_PROFILE,
     CONF_IMPORT_PROFILE,
     CONF_REVALIDATE_DAYS,
@@ -31,8 +30,17 @@ from .const import (
     DOMAIN,
 )
 
-IMPORT_OPTIONS = ["ICQ2", "ICC1"]
-EXPORT_OPTIONS = ["ISQ2", "ISC1"]
+# Profile codes, metering types and units are language-independent labels.
+IMPORT_OPTIONS = [
+    {"value": "ICQ2", "label": "ICQ2 (A/B, kWh)"},
+    {"value": "ICC1", "label": "ICC1 (A/B, kW)"},
+    {"value": "DCQC", "label": "DCQC (C1, kWh)"},
+]
+EXPORT_OPTIONS = [
+    {"value": "ISQ2", "label": "ISQ2 (A/B, kWh)"},
+    {"value": "ISC1", "label": "ISC1 (A/B, kW)"},
+    {"value": "DSQC", "label": "DSQC (C1, kWh)"},
+]
 
 
 def _build_user_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:

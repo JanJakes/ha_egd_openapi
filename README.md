@@ -86,19 +86,29 @@ Chování synchronizace:
 - při dalších spuštěních kontroluje jen poslední konfigurovatelné období zpětně,
 - pokud v době plánované synchronizace ještě nejsou k dispozici nejnovější data, průběžný watchdog zkusí načtení zopakovat později.
 
-Importují se pouze záznamy se stavem, který integrace považuje za validní pro statistické zpracování.
+Započítávají se pouze platné hodnoty (`W`, původní `IU012`). Dočasné (`G`),
+chybějící (`F`) a ostatní statusy se nezapočítávají. Pozdější opravy se promítnou
+při zpětné kontrole nastaveného období.
 
 ## Podporované profily
 
-Pro konfiguraci jsou aktuálně podporované tyto profily:
+Profil vyberte podle typu měření odběrného místa:
 
-- odběr: `ICQ2`, `ICC1`
-- dodávka: `ISQ2`, `ISC1`
+| Typ měření | Odběr ze sítě | Dodávka do sítě | Zpracování |
+| --- | --- | --- | --- |
+| **C1 (chytrý elektroměr)** | **`DCQC`** | **`DSQC`** | Energie v kWh, bez převodu. |
+| A/B, energie | `ICQ2` | `ISQ2` | Energie v kWh, bez převodu. |
+| A/B, výkon | `ICC1` | `ISC1` | Průměrný výkon za 15 minut v kW, převod na kWh dělením čtyřmi. |
 
-Poznámka k převodu hodnot:
+Profily a status `W` popisuje [návod EG.D OpenAPI](https://www.egd.cz/sites/default/files/2026-05/uzivatelsky_navod_openapi_abc.pdf).
 
-- profily `ICQ2` a `ISQ2` se používají přímo,
-- profily `ICC1` a `ISC1` integrace převádí na `kWh` dělením čtyřmi.
+Profily lze zvolit při přidání integrace i později přes **Konfigurovat**.
+Výchozí volby `ICQ2` a `ISQ2` zůstávají zachované; pro C1 vyberte `DCQC` a `DSQC`.
+Po změně profilu se znovu načte dostupná historie bez dvojího započítání spotřeby.
+
+U C1 bez přetoků může `DSQC` vracet prázdná data. Odběr se přesto importuje,
+ale diagnostika může zůstat ve stavu `waiting_for_data` a čas poslední úspěšné
+synchronizace se nemusí posouvat.
 
 ## Omezení a specifika EG.D API
 
