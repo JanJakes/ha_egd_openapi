@@ -16,7 +16,13 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import EgdApiClient, EgdApiError, EgdAuthError, IntervalRecord
+from .api import (
+    EgdApiClient,
+    EgdApiError,
+    EgdAuthError,
+    IntervalRecord,
+    get_history_start,
+)
 from .const import (
     ATTR_LAST_API_SYNC_UTC,
     ATTR_LAST_CHECK_FINISHED_UTC,
@@ -59,15 +65,6 @@ PROFILE_MIN_DATES: dict[str, date] = {
 
 # W is valid in the EG.D guide; IU012 is the legacy code.
 ALLOWED_STATUSES = {"IU012", "W"}
-
-
-def _three_years_ago_safe(dt: datetime) -> datetime:
-    """Return a conservative timestamp within EG.D rolling 3-year limit."""
-    try:
-        capped = dt.replace(year=dt.year - 3)
-    except ValueError:
-        capped = dt.replace(month=2, day=28, year=dt.year - 3)
-    return capped + timedelta(days=1)
 
 
 @dataclass(slots=True)
@@ -538,7 +535,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         - first sync (or migration without local hourly cache): fetch full history
         - subsequent daily runs: revalidate a rolling window from the configured day offset
         """
-        hard_min = self._hard_min_for_profile(profile, latest_available_utc)
+        hard_min = self._hard_min_for_profile(profile)
         cache_complete = bool(self._persisted.get(cache_complete_key))
         previous_profile = self._persisted.get(
             profile_key, self.config_entry.data.get(profile_key)
@@ -610,6 +607,9 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         latest_available_utc: datetime,
     ) -> datetime | None:
         """Find the first day accepted by EG.D for the configured EAN/profile."""
+        candidate_start = max(candidate_start, get_history_start())
+        if candidate_start > latest_available_utc:
+            return None
         first_day = candidate_start.date()
         last_day = latest_available_utc.date()
 
@@ -644,7 +644,10 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             return None
 
         accessible_day = first_day + timedelta(days=accessible_offset)
-        return datetime.combine(accessible_day, time(0, 0), tzinfo=timezone.utc)
+        return max(
+            candidate_start,
+            datetime.combine(accessible_day, time(0, 0), tzinfo=timezone.utc),
+        )
 
     async def _probe_accessible_day(
         self,
@@ -655,7 +658,10 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         latest_available_utc: datetime,
     ) -> bool:
         """Return whether one UTC day is accepted by EG.D."""
-        probe_from = datetime.combine(day, time(0, 0), tzinfo=timezone.utc)
+        probe_from = max(
+            datetime.combine(day, time(0, 0), tzinfo=timezone.utc),
+            get_history_start(),
+        )
         probe_to = min(
             datetime.combine(day, time(23, 45), tzinfo=timezone.utc),
             latest_available_utc,
@@ -689,7 +695,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
 
         latest_hour = latest_available_utc.replace(minute=0, second=0, microsecond=0)
         window_start = (
-            fetched_from or self._hard_min_for_profile(profile, latest_available_utc)
+            fetched_from or self._hard_min_for_profile(profile)
         ).replace(minute=0, second=0, microsecond=0)
 
         old_sums = self._build_cumulative_sum_map(existing, window_start, latest_hour)
@@ -707,7 +713,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
 
         self._persisted[cache_key] = self._serialize_hourly_deltas(merged)
 
-        hard_min = self._hard_min_for_profile(profile, latest_available_utc)
+        hard_min = self._hard_min_for_profile(profile)
         accessible_start = self._parse_dt(self._persisted.get(accessible_start_key))
         if accessible_start is None and not existing and fetched_from is not None:
             accessible_start = fetched_from
@@ -1112,16 +1118,16 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             return left is right
         return abs(left - right) <= tolerance
 
-    def _hard_min_for_profile(self, profile: str, latest: datetime) -> datetime:
+    def _hard_min_for_profile(self, profile: str) -> datetime:
         """Return earliest allowed start for a profile."""
-        hard_min = _three_years_ago_safe(latest)
+        hard_min = get_history_start()
 
         profile_min = PROFILE_MIN_DATES.get(profile)
         if profile_min is not None:
             profile_min_dt = datetime.combine(profile_min, time(0, 0), tzinfo=timezone.utc)
             hard_min = max(hard_min, profile_min_dt)
 
-        return min(hard_min, latest)
+        return hard_min
 
     def _get_latest_available_utc(self) -> datetime:
         """Return latest allowed EG.D quarter-hour timestamp.
