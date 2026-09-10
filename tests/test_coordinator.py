@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -12,6 +13,7 @@ pytest.importorskip("homeassistant")
 from types import SimpleNamespace
 
 from custom_components.ha_egd_openapi import coordinator as coordinator_module
+from custom_components.ha_egd_openapi import statistics as statistics_module
 from custom_components.ha_egd_openapi.api import IntervalRecord
 from custom_components.ha_egd_openapi.const import (
     ATTR_LAST_ERROR,
@@ -400,3 +402,137 @@ def test_next_sync_attempt_prefers_watchdog_when_waiting_for_data() -> None:
 
     assert next_attempt == datetime(2026, 4, 12, 19, 0, tzinfo=timezone.utc)
     assert reason == "watchdog_retry"
+
+
+@pytest.mark.parametrize(
+    "profile,status,factor",
+    [
+        ("DCQC", "W", 1),
+        ("DSQC", "W", 1),
+        ("ICQ2", "W", 1),
+        ("ISQ2", "W", 1),
+        ("ICC1", "W", 0.25),
+        ("ISC1", "W", 0.25),
+        ("DCQC", "IU012", 1),
+    ],
+)
+def test_valid_energy_values(profile, status, factor) -> None:
+    """C1 and A/B energy are summed directly; only power is divided by four."""
+    coordinator = _build_coordinator()
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    records = [
+        IntervalRecord(start + timedelta(minutes=i * 15), value, status)
+        for i, value in enumerate([0.07, 0.08, 0.09, 0.1])
+    ]
+    hourly, meta = coordinator._process_records_hourly(records=records, profile=profile)
+    assert hourly == {start: pytest.approx(0.34 * factor)}
+    assert meta == {
+        "last_valid_ts": start + timedelta(minutes=45),
+        "last_status": status,
+    }
+
+
+@pytest.mark.parametrize(
+    "status,value",
+    [
+        ("G", 10.0),
+        ("F", None),
+        ("UNKNOWN", 10.0),
+        ("B", 10.0),
+        ("E", 10.0),
+        ("M", 10.0),
+        ("N", 10.0),
+    ],
+)
+def test_unfinalized_or_missing_records_do_not_contribute(status, value) -> None:
+    coordinator = _build_coordinator()
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    hourly, meta = coordinator._process_records_hourly(
+        records=[IntervalRecord(start, value, status)],
+        profile="DCQC",
+    )
+    assert hourly == {}
+    assert meta == {"last_valid_ts": None, "last_status": status}
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), float("-inf")])
+def test_missing_or_nonfinite_final_values_do_not_corrupt_statistics(value) -> None:
+    coordinator = _build_coordinator()
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    hourly, meta = coordinator._process_records_hourly(
+        records=[IntervalRecord(start, value, "W")],
+        profile="DCQC",
+    )
+    assert hourly == {}
+    assert meta["last_valid_ts"] is None
+
+
+@pytest.mark.parametrize("has_export", [True, False])
+@pytest.mark.asyncio
+async def test_c1_refresh_imports_recorder_energy_and_handles_empty_export(
+    monkeypatch, has_export
+) -> None:
+    """Exercise history, Recorder metadata, totals, diagnostics and a repeat refresh."""
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=45)
+    imports = [
+        IntervalRecord(start + timedelta(minutes=i * 15), value, "W")
+        for i, value in enumerate([0.07, 0.08, 0.09, 0.1])
+    ]
+    exports = [IntervalRecord(end, 0.05, "W")] if has_export else []
+    coordinator = _build_c1_coordinator(
+        monkeypatch, start, end, [imports, exports, imports, exports]
+    )
+    add_statistics = MagicMock()
+    monkeypatch.setattr(
+        statistics_module, "async_add_external_statistics", add_statistics
+    )
+
+    state = await coordinator._async_refresh_energy_state()
+    assert state.total_import_kwh == 0.34
+    assert state.total_export_kwh == (0.05 if has_export else 0.0)
+    assert state.last_import_status == "W"
+    assert state.last_valid_import_timestamp == "2026-08-01T00:45:00Z"
+    assert state.sync_status == ("ok" if has_export else "waiting_for_data")
+    assert bool(state.last_api_sync_utc) == has_export
+    assert add_statistics.call_count == (2 if has_export else 1)
+    for call, direction, total in zip(
+        add_statistics.call_args_list, ["import", "export"], [0.34, 0.05]
+    ):
+        _, metadata, rows = call.args
+        assert (
+            metadata["statistic_id"]
+            == f"ha_egd_openapi:meter_859182400000000000_{direction}"
+        )
+        assert metadata["unit_of_measurement"] == "kWh"
+        assert metadata["unit_class"] == "energy"
+        assert metadata["has_sum"] is True
+        assert metadata["has_mean"] is False
+        assert rows == [{"start": start, "state": total, "sum": total}]
+
+    add_statistics.reset_mock()
+    again = await coordinator._async_refresh_energy_state()
+    assert again.total_import_kwh == state.total_import_kwh
+    assert again.total_export_kwh == state.total_export_kwh
+    add_statistics.assert_not_called()
+
+
+def _build_c1_coordinator(monkeypatch, start, end, responses):
+    coordinator = _build_coordinator()
+    coordinator.hass = MagicMock()
+    coordinator.config_entry.title = "Fake C1 meter"
+    coordinator.config_entry.data.update(
+        {
+            "ean": "859182400000000000",
+            "import_profile": "DCQC",
+            "export_profile": "DSQC",
+        }
+    )
+    coordinator._store = SimpleNamespace(async_save=AsyncMock())
+    coordinator.client = SimpleNamespace(
+        async_probe_access=AsyncMock(return_value=True),
+        async_get_profile_data=AsyncMock(side_effect=responses),
+    )
+    monkeypatch.setattr(coordinator, "_hard_min_for_profile", lambda *args: start)
+    monkeypatch.setattr(coordinator, "_get_latest_available_utc", lambda: end)
+    return coordinator

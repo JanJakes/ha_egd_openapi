@@ -11,7 +11,7 @@ from typing import Any
 import aiohttp
 from aiohttp import ClientError
 
-from .const import DATA_URL, OAUTH_URL
+from .const import DATA_URL, OAUTH_URL, PROFILE_UNITS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class IntervalRecord:
     """One interval record from EG.D."""
 
     timestamp: datetime
-    value: float
+    value: float | None
     status: str
 
 
@@ -464,6 +464,11 @@ class EgdApiClient:
             if len(payloads) != 1 or not isinstance(payloads[0], dict):
                 raise EgdApiError("Unexpected profile response format")
             payload = payloads[0]
+            if payload.get("profile", profile) != profile:
+                raise EgdApiError("Unexpected profile in response")
+            units = payload.get("units")
+            if units is not None and str(units).casefold() != PROFILE_UNITS[profile].casefold():
+                raise EgdApiError(f"Unexpected units for {profile}: {units}")
             batch = payload.get("data")
             if not isinstance(batch, list):
                 raise EgdApiError("Profile response does not contain a data list")
@@ -483,10 +488,11 @@ class EgdApiClient:
                 if ts in seen_timestamps:
                     raise EgdApiError("Duplicate interval in profile response")
                 seen_timestamps.add(ts)
+                value = item.get("value")
                 records.append(
                     IntervalRecord(
                         timestamp=ts,
-                        value=float(item.get("value", 0.0)),
+                        value=float(value) if value is not None else None,
                         status=str(item.get("status", "")),
                     )
                 )

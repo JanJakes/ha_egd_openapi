@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
-import logging
+from math import isfinite
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -25,12 +26,12 @@ from .const import (
     ATTR_LAST_IMPORT_STATUS,
     ATTR_LAST_MANUAL_REFRESH_RESULT,
     ATTR_LAST_MANUAL_REFRESH_UTC,
-    ATTR_NEXT_SYNC_ATTEMPT_UTC,
-    ATTR_NEXT_SYNC_REASON,
-    ATTR_SYNC_STATUS,
     ATTR_LAST_UPDATE_UTC,
     ATTR_LAST_VALID_EXPORT_TS,
     ATTR_LAST_VALID_IMPORT_TS,
+    ATTR_NEXT_SYNC_ATTEMPT_UTC,
+    ATTR_NEXT_SYNC_REASON,
+    ATTR_SYNC_STATUS,
     CONF_EAN,
     CONF_ENABLE_DIAGNOSTICS,
     CONF_EXPORT_PROFILE,
@@ -39,10 +40,11 @@ from .const import (
     CONF_UPDATE_HOUR,
     CONF_UPDATE_MINUTE,
     DEFAULT_ENABLE_DIAGNOSTICS,
-    DOMAIN,
-    DIAGNOSTICS_EVENTS_KEY,
     DEFAULT_REVALIDATE_DAYS,
+    DIAGNOSTICS_EVENTS_KEY,
+    DOMAIN,
     MAX_DIAGNOSTIC_EVENTS,
+    PROFILE_UNITS,
     STORE_KEY,
     STORE_VERSION,
 )
@@ -55,7 +57,7 @@ PROFILE_MIN_DATES: dict[str, date] = {
     "ISQ2": date(2024, 7, 1),
 }
 
-# Návod EG.D doporučuje zapisovat jen standardně platné A/B hodnoty.
+# W is valid in the EG.D guide; IU012 is the legacy code.
 ALLOWED_STATUSES = {"IU012", "W"}
 
 
@@ -483,7 +485,11 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         for record in records:
             last_status = record.status
 
-            if record.status not in ALLOWED_STATUSES:
+            if (
+                record.status not in ALLOWED_STATUSES
+                or record.value is None
+                or not isfinite(record.value)
+            ):
                 continue
 
             value_kwh = self._record_to_kwh(record.value, profile)
@@ -1109,7 +1115,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
     @staticmethod
     def _record_to_kwh(value: float, profile: str) -> float:
         """Convert API value to kWh."""
-        if profile in {"ICC1", "ISC1"}:
+        if PROFILE_UNITS[profile] == "kW":
             return value / 4
         return value
 

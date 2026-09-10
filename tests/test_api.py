@@ -134,6 +134,50 @@ async def test_profile_data_chunk_accepts_object_payload() -> None:
 
 
 @pytest.mark.parametrize(
+    "profile,units",
+    [
+        ("DCQC", "kWh"),
+        ("DSQC", "kWh"),
+        ("ICQ2", "KWH"),
+        ("ISQ2", "kWh"),
+        ("ICC1", "KW"),
+        ("ISC1", "kW"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_profile_units_and_nullable_missing_values(profile, units) -> None:
+    """Keep interval values unchanged and allow missing readings without energy."""
+    client = _ResponseShapeClient(
+        {
+            "profile": profile,
+            "units": units,
+            "total": 2,
+            "data": [
+                {"timestamp": "2026-08-01T00:00:00Z", "value": 0.07, "status": "W"},
+                {"timestamp": "2026-08-01T00:15:00Z", "value": None, "status": "F"},
+            ],
+        }
+    )
+    records = await _fetch_chunk(client, profile=profile)
+    assert [record.value for record in records] == [0.07, None]
+    assert [record.status for record in records] == ["W", "F"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"profile": "DSQC", "units": "kWh", "data": [], "total": 0},
+        {"profile": "DCQC", "units": "kW", "data": [], "total": 0},
+    ],
+)
+@pytest.mark.asyncio
+async def test_mismatched_profile_or_units_fail_explicitly(payload) -> None:
+    """Never checkpoint data for the wrong profile or unit."""
+    with pytest.raises(api.EgdApiError):
+        await _fetch_chunk(_ResponseShapeClient(payload), profile="DCQC")
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {"data": None},
