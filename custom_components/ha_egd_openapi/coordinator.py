@@ -158,6 +158,16 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         if self.data is None:
             return True
 
+        for profile_key in (CONF_IMPORT_PROFILE, CONF_EXPORT_PROFILE):
+            profile = self.config_entry.options.get(
+                profile_key, self.config_entry.data.get(profile_key)
+            )
+            previous_profile = self._persisted.get(
+                profile_key, self.config_entry.data.get(profile_key)
+            )
+            if profile != previous_profile:
+                return True
+
         next_sync_attempt = self._parse_dt(self._persisted.get(ATTR_NEXT_SYNC_ATTEMPT_UTC))
         if next_sync_attempt is None:
             return True
@@ -238,6 +248,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             cache_complete_key=self._IMPORT_CACHE_COMPLETE_KEY,
             accessible_start_key=self._IMPORT_ACCESSIBLE_START_KEY,
             last_valid_key=ATTR_LAST_VALID_IMPORT_TS,
+            profile_key=CONF_IMPORT_PROFILE,
         )
         export_from = await self._determine_start_timestamp(
             ean=ean,
@@ -246,6 +257,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             cache_complete_key=self._EXPORT_CACHE_COMPLETE_KEY,
             accessible_start_key=self._EXPORT_ACCESSIBLE_START_KEY,
             last_valid_key=ATTR_LAST_VALID_EXPORT_TS,
+            profile_key=CONF_EXPORT_PROFILE,
         )
         _LOGGER.debug(
             "Refreshing EG.D state for EAN %s: import profile %s from %s, export profile %s from %s, latest available %s",
@@ -467,6 +479,10 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
             }
         )
 
+        if import_from is not None:
+            self._persisted[CONF_IMPORT_PROFILE] = import_profile
+        if export_from is not None:
+            self._persisted[CONF_EXPORT_PROFILE] = export_profile
         await self._store.async_save(self._persisted)
         return state
 
@@ -484,6 +500,10 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
 
         for record in records:
             last_status = record.status
+            hour_start = record.timestamp.replace(minute=0, second=0, microsecond=0)
+            # Explicit invalid records must also replace previously valid hours.
+            # An absent hour is left untouched by the merge.
+            hourly.setdefault(hour_start, 0.0)
 
             if (
                 record.status not in ALLOWED_STATUSES
@@ -493,7 +513,6 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
                 continue
 
             value_kwh = self._record_to_kwh(record.value, profile)
-            hour_start = record.timestamp.replace(minute=0, second=0, microsecond=0)
             hourly[hour_start] += value_kwh
             newest_valid_ts = record.timestamp
 
@@ -511,6 +530,7 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         cache_complete_key: str,
         accessible_start_key: str,
         last_valid_key: str,
+        profile_key: str,
     ) -> datetime | None:
         """Determine where next fetch should start.
 
@@ -520,8 +540,12 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
         """
         hard_min = self._hard_min_for_profile(profile, latest_available_utc)
         cache_complete = bool(self._persisted.get(cache_complete_key))
-        if not cache_complete:
-            if self._parse_dt(self._persisted.get(last_valid_key)) is None:
+        previous_profile = self._persisted.get(
+            profile_key, self.config_entry.data.get(profile_key)
+        )
+        profile_changed = previous_profile is not None and previous_profile != profile
+        if profile_changed or not cache_complete:
+            if profile_changed or self._parse_dt(self._persisted.get(last_valid_key)) is None:
                 accessible_start = await self._find_first_accessible_timestamp(
                     ean=ean,
                     profile=profile,
@@ -529,6 +553,8 @@ class EgdDataUpdateCoordinator(DataUpdateCoordinator[EnergyState]):
                     latest_available_utc=latest_available_utc,
                 )
                 self._persisted[accessible_start_key] = self._iso(accessible_start)
+                if profile_changed:
+                    self._persisted[cache_complete_key] = False
                 if accessible_start is None:
                     self._record_diagnostic_event(
                         "info",

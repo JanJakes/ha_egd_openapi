@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 from custom_components.ha_egd_openapi import coordinator as coordinator_module
 from custom_components.ha_egd_openapi import statistics as statistics_module
-from custom_components.ha_egd_openapi.api import IntervalRecord
+from custom_components.ha_egd_openapi.api import EgdApiError, IntervalRecord
 from custom_components.ha_egd_openapi.const import (
     ATTR_LAST_ERROR,
     ATTR_SYNC_STATUS,
@@ -247,6 +247,7 @@ async def test_determine_start_timestamp_skips_unauthorized_history() -> None:
         cache_complete_key="cache_complete",
         accessible_start_key="accessible_start",
         last_valid_key="last_valid",
+        profile_key="import_profile",
     )
 
     assert start == datetime(2026, 4, 5, 0, 0, tzinfo=timezone.utc)
@@ -451,7 +452,7 @@ def test_unfinalized_or_missing_records_do_not_contribute(status, value) -> None
         records=[IntervalRecord(start, value, status)],
         profile="DCQC",
     )
-    assert hourly == {}
+    assert hourly == {start: 0.0}
     assert meta == {"last_valid_ts": None, "last_status": status}
 
 
@@ -463,8 +464,143 @@ def test_missing_or_nonfinite_final_values_do_not_corrupt_statistics(value) -> N
         records=[IntervalRecord(start, value, "W")],
         profile="DCQC",
     )
-    assert hourly == {}
+    assert hourly == {start: 0.0}
     assert meta["last_valid_ts"] is None
+
+
+@pytest.mark.parametrize("initial_status,final_status", [("G", "W"), ("F", "IU012")])
+def test_revalidation_repairs_cumulative_statistics(
+    initial_status, final_status
+) -> None:
+    """Valid corrections replace an hour and update every following sum once."""
+    coordinator = _build_coordinator()
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    records = [
+        IntervalRecord(start, 10.0, initial_status),
+        IntervalRecord(end, 0.5, "W"),
+    ]
+    total, rows = _merge_records(coordinator, records, start, end)
+    assert total == 0.5
+    assert [row["sum"] for row in rows] == [0.0, 0.5]
+
+    records[0] = IntervalRecord(start, 0.25, final_status)
+    total, rows = _merge_records(coordinator, records, start, end)
+    assert total == 0.75
+    assert rows == [
+        {"start": start, "state": 0.25, "sum": 0.25},
+        {"start": end, "state": 0.75, "sum": 0.75},
+    ]
+    assert _merge_records(coordinator, records, start, end) == (0.75, [])
+
+    # A subsequent explicit missing value removes the old contribution.
+    records[0] = IntervalRecord(start, None, "F")
+    total, rows = _merge_records(coordinator, records, start, end)
+    assert total == 0.5
+    assert [row["sum"] for row in rows] == [0.0, 0.5]
+    # An empty response does not claim that previously fetched energy was zero.
+    assert _merge_records(coordinator, [], start, end) == (0.5, [])
+
+
+@pytest.mark.parametrize(
+    "direction,old_profile,new_profile",
+    [("import", "ICQ2", "DCQC"), ("export", "ISQ2", "DSQC")],
+)
+@pytest.mark.parametrize("has_profile_checkpoint", [False, True])
+@pytest.mark.asyncio
+async def test_profile_switch_replaces_history_and_retries_failed_fetch(
+    monkeypatch, direction, old_profile, new_profile, has_profile_checkpoint
+) -> None:
+    """Switch profiles with cached history, retry failures, and avoid double counting."""
+    start = datetime(2026, 4, 5, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 31, 23, tzinfo=timezone.utc)
+    records = [
+        IntervalRecord(start, 0.25, "W"),
+        IntervalRecord(start + timedelta(hours=1), None, "F"),
+        IntervalRecord(end, 0.75, "W"),
+    ]
+    coordinator = _build_c1_coordinator(monkeypatch, start, end, [])
+    profile_key = f"{direction}_profile"
+    cache_key = f"{direction}_hourly_deltas"
+    total_key = f"total_{direction}_kwh"
+    old_cache = coordinator._serialize_hourly_deltas(
+        {
+            start - timedelta(hours=1): 0.5,
+            start: 1.0,
+            start + timedelta(hours=1): 0.5,
+            end: 0.75,
+        }
+    )
+    coordinator.config_entry.data[profile_key] = old_profile
+    coordinator.config_entry.options[profile_key] = new_profile
+    coordinator._persisted.update(
+        {
+            cache_key: old_cache,
+            f"{cache_key}_complete": True,
+            f"last_valid_{direction}_timestamp": coordinator._iso(end),
+            total_key: 2.75,
+            "next_sync_attempt_utc": "2099-01-01T00:00:00Z",
+        }
+    )
+    if has_profile_checkpoint:
+        coordinator._persisted[profile_key] = old_profile
+    coordinator.data = coordinator._build_state_from_persisted()
+    assert coordinator.should_refresh_on_startup()
+    add_statistics = MagicMock()
+    monkeypatch.setattr(
+        statistics_module, "async_add_external_statistics", add_statistics
+    )
+
+    async def fail_selected_profile(**kwargs):
+        if kwargs["profile"] == new_profile:
+            raise EgdApiError("Incomplete page")
+        return []
+
+    coordinator.client.async_get_profile_data.side_effect = fail_selected_profile
+    with pytest.raises(EgdApiError, match="Incomplete"):
+        await coordinator._async_refresh_energy_state()
+    assert coordinator._persisted[cache_key] == old_cache
+    assert coordinator._persisted.get(profile_key) == (
+        old_profile if has_profile_checkpoint else None
+    )
+    add_statistics.assert_not_called()
+
+    async def respond(**kwargs):
+        if kwargs["profile"] != new_profile:
+            return []
+        return [record for record in records if record.timestamp >= kwargs["from_dt"]]
+
+    coordinator.client.async_get_profile_data.reset_mock(side_effect=True)
+    coordinator.client.async_get_profile_data.side_effect = respond
+    state = await coordinator._async_refresh_energy_state()
+    assert getattr(state, total_key) == 1.5
+    assert coordinator._persisted[profile_key] == new_profile
+    assert coordinator._persisted[f"{cache_key}_complete"] is True
+    selected_call = next(
+        call
+        for call in coordinator.client.async_get_profile_data.call_args_list
+        if call.kwargs["profile"] == new_profile
+    )
+    assert selected_call.kwargs["from_dt"] == start
+    add_statistics.assert_called_once()
+    _, metadata, rows = add_statistics.call_args.args
+    assert metadata["statistic_id"].endswith(f"_{direction}")
+    assert rows == [
+        {"start": start, "state": 0.75, "sum": 0.75},
+        {"start": start + timedelta(hours=1), "state": 0.75, "sum": 0.75},
+        {"start": end, "state": 1.5, "sum": 1.5},
+    ]
+
+    add_statistics.reset_mock()
+    coordinator.client.async_get_profile_data.reset_mock()
+    again = await coordinator._async_refresh_energy_state()
+    assert getattr(again, total_key) == 1.5
+    add_statistics.assert_not_called()
+    assert coordinator.client.async_get_profile_data.call_count == 2
+    assert all(
+        call.kwargs["from_dt"] == datetime(2026, 8, 1, tzinfo=timezone.utc)
+        for call in coordinator.client.async_get_profile_data.call_args_list
+    )
 
 
 @pytest.mark.parametrize("has_export", [True, False])
@@ -495,6 +631,8 @@ async def test_c1_refresh_imports_recorder_energy_and_handles_empty_export(
     assert state.last_valid_import_timestamp == "2026-08-01T00:45:00Z"
     assert state.sync_status == ("ok" if has_export else "waiting_for_data")
     assert bool(state.last_api_sync_utc) == has_export
+    assert coordinator._persisted["import_profile"] == "DCQC"
+    assert coordinator._persisted["export_profile"] == "DSQC"
     assert add_statistics.call_count == (2 if has_export else 1)
     for call, direction, total in zip(
         add_statistics.call_args_list, ["import", "export"], [0.34, 0.05]
@@ -517,6 +655,20 @@ async def test_c1_refresh_imports_recorder_energy_and_handles_empty_export(
     add_statistics.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fetch_failure_does_not_checkpoint_partial_history(monkeypatch) -> None:
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    coordinator = _build_c1_coordinator(
+        monkeypatch, start, start, EgdApiError("Incomplete profile response")
+    )
+    with pytest.raises(EgdApiError, match="Incomplete"):
+        await coordinator._async_refresh_energy_state()
+    assert "import_profile" not in coordinator._persisted
+    assert "import_hourly_deltas" not in coordinator._persisted
+    assert "import_hourly_deltas_complete" not in coordinator._persisted
+    coordinator._store.async_save.assert_not_awaited()
+
+
 def _build_c1_coordinator(monkeypatch, start, end, responses):
     coordinator = _build_coordinator()
     coordinator.hass = MagicMock()
@@ -536,3 +688,17 @@ def _build_c1_coordinator(monkeypatch, start, end, responses):
     monkeypatch.setattr(coordinator, "_hard_min_for_profile", lambda *args: start)
     monkeypatch.setattr(coordinator, "_get_latest_available_utc", lambda: end)
     return coordinator
+
+
+def _merge_records(coordinator, records, start, end):
+    hourly, _ = coordinator._process_records_hourly(records=records, profile="DCQC")
+    return coordinator._merge_statistics(
+        cache_key="hourly_deltas",
+        cache_complete_key="complete",
+        persisted_total_key="total",
+        fetched_from=start,
+        latest_available_utc=end,
+        profile="DCQC",
+        accessible_start_key="accessible_start",
+        hourly_deltas=hourly,
+    )

@@ -87,7 +87,8 @@ Chování synchronizace:
 - pokud v době plánované synchronizace ještě nejsou k dispozici nejnovější data, průběžný watchdog zkusí načtení zopakovat později.
 
 Započítávají se pouze platné hodnoty (`W`, původní `IU012`). Dočasné (`G`),
-chybějící (`F`) a ostatní statusy se nezapočítávají.
+chybějící (`F`) a ostatní statusy se nezapočítávají. Pozdější opravy se promítnou
+při zpětné kontrole nastaveného období.
 
 ## Podporované profily
 
@@ -103,6 +104,7 @@ Profily a status `W` popisuje [návod EG.D OpenAPI](https://www.egd.cz/sites/def
 
 Profily lze zvolit při přidání integrace i později přes **Konfigurovat**.
 Výchozí volby `ICQ2` a `ISQ2` zůstávají zachované; pro C1 vyberte `DCQC` a `DSQC`.
+Po změně profilu se znovu načte dostupná historie bez dvojího započítání spotřeby.
 
 U C1 bez přetoků může `DSQC` vracet prázdná data. Odběr se přesto importuje,
 ale diagnostika může zůstat ve stavu `waiting_for_data` a čas poslední úspěšné
